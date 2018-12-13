@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Crea un pipeline para Infraestructura
+
+## ***************************** Parameters section ************************************
+Parameters:
+
+  CodepipelineBucket:
+    Description: "Bucket for codepipeline"
+    Type: String
+
+  ClusterName:
+    Description: "EKS ClusterName"
+    Type: String
+
+  Repository:
+    Description: "Repository"
+    Type: String
+
+  OAuthToken:
+    Description: "OAuth Token"
+    Type: String
+    NoEcho: true
+
+  Owner:
+    Description: "Github Owner"
+    Type: String
+
+## ***************************** Resources section ************************************
+Resources:
+
+
+  EcrDockerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+
+#############################################################################
+# CodeBuild: BuildProject: Test Files
+# - Utiliza serverless framework para hacer despliegue de funciones serverless
+
+  DeployContainer:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/docker:17.09.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrDockerRepository}
+          - Name: EKS_CLUSTER_NAME
+            Value: !Ref ClusterName
+          - Name: EKS_KUBECTL_ROLE_ARN
+            Value: 
+              Fn::ImportValue: 
+                !Sub "${ClusterName}-master-role"
+      Name: !Sub "codebuild-worker-join"
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        BuildSpec: !Sub |
+            version: 0.2
+            phases:
+              install:
+                commands:
+                  - pwd
+                  - curl -sS -o /usr/local/bin/kubectl https://amazon-eks.s3-us-west-2.amazonaws.com/1.10.3/2018-07-26/bin/linux/amd64/kubectl
+                  - curl -o /usr/local/bin/aws-iam-authenticator https://amazon-eks.s3-us-west-2.amazonaws.com/1.10.3/2018-07-26/bin/linux/amd64/aws-iam-authenticator
+                  - ls -lh /usr/local/bin/
+                  - apt-get update && apt-get -y install jq golang python3-pip python3-dev && pip3 install --upgrade awscli
+                  - export KUBECONFIG=$HOME/.kube/config
+                  - chmod +x /usr/local/bin/kubectl /usr/local/bin/aws-iam-authenticator
+              pre_build:
+                commands:
+                  - TAG="$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+                  - sed -i 's@CONTAINER_IMAGE@'"$REPOSITORY_URI:$TAG"'@' hello-k8s.yml
+                  - $(aws ecr get-login --no-include-email)
+              build:
+                commands:
+                  - CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+                  - docker build --tag $REPOSITORY_URI:$TAG .
+              post_build:
+                commands:
+                  - docker push $REPOSITORY_URI:$TAG
+                  - echo $EKS_KUBECTL_ROLE_ARN
+                  - CREDS=$(aws sts assume-role --role-arn $EKS_KUBECTL_ROLE_ARN --role-session-name codebuild-kubectl --duration-seconds 900)
+                  - echo $CREDS
+                  - export AWS_ACCESS_KEY_ID="$(echo $CREDS | jq -r '.Credentials.AccessKeyId')"
+                  - export AWS_SECRET_ACCESS_KEY="$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')"
+                  - export AWS_SESSION_TOKEN="$(echo $CREDS | jq -r '.Credentials.SessionToken')"
+                  - export AWS_EXPIRATION=$(echo $CREDS | jq -r '.Credentials.Expiration')
+                  - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME
+                  - kubectl apply -f hello-k8s.yml
+                  - printf '[{"name":"hello-k8s","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+
+        Type: CODEPIPELINE
+
+#############################################################################
+# CodeBuild: B
+# - Utiliza serverless framework para hacer despliegue de funciones serverless
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: 
+                  Fn::ImportValue: 
+                    !Sub "${ClusterName}-master-role"
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - eks:Describe*
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+              - Resource: !Sub arn:aws:s3:::${CodepipelineBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrDockerRepository}
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+
+############################################################################
+# Pipeline: ApplicationPipeline
+# - Pipeline Multi-Stage para hacer el release management de una aplicacion
+
+  bc:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      RoleArn: !GetAtt PipeLineRole.Arn
+      Stages:
+        -
+          Name: Source
+          Actions:
+            - RunOrder: 1
+              Name: SourceFiles
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref Owner
+                OAuthToken: !Ref OAuthToken
+                Repo: !Ref Repository
+                Branch: "master"
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: Repo
+
+            - RunOrder: 2
+              Name: "DeployApp"
+              InputArtifacts:
+                - Name: Repo
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref DeployContainer
+              OutputArtifacts: []
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodepipelineBucket
+
+############################################################################
+# Role: IAM Roles
+# - Role required for CodePipeline
+
+  PipeLineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+
+  PipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-codepipeline-policy"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Action:
+             - codebuild:StartBuild
+             - codebuild:BatchGetBuilds
+            Resource:
+            - "*"
+          -
+            Effect: Allow
+            Action:
+              - codepipeline:*
+              - iam:ListRoles
+              - iam:PassRole
+              - s3:ListAllMyBuckets
+              - s3:GetBucketLocation
+            Resource:
+              - "*"
+          -
+            Effect: Allow
+            Action:
+              - cloudformation:Describe*
+              - cloudFormation:List*
+              - cloudformation:CreateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:SetStackPolicy
+              - cloudformation:ValidateTemplate
+            Resource:
+              - "*"
+          -
+            Effect: Allow
+            Action:
+              - s3:*
+            Resource:
+              - !Sub "arn:aws:s3:::${CodepipelineBucket}"
+              - !Sub "arn:aws:s3:::${CodepipelineBucket}/*"
+      Roles:
+        - !Ref PipeLineRole
+
+  CFDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+                - codebuild.amazonaws.com
+                - codepipeline.amazonaws.com
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - sts:AssumeRole
+      Path: /

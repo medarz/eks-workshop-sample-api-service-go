@@ -1,3 +1,6 @@
 *.swp
 main
 eks-workshop-sample-app-temp
+run*
+ci-cd-codepipeline.cfn.yml
+
